@@ -1,7 +1,8 @@
 import itertools
 
 import numpy as np
-import torch
+
+# import torch
 
 
 # class to implement the Hubbard Hamiltonian in real space
@@ -14,7 +15,7 @@ class HamiltonianOperator:
         self.U = U
 
         # build H
-        self.H = torch.from_numpy(self.build_H()).cfloat()
+        self.H = self.build_H().astype(np.complex64)
 
     def generate_basis(self):
         # diff = n_spin_up - n_spin_down
@@ -42,7 +43,7 @@ class HamiltonianOperator:
         # lookup table
         self.state_to_index = {tuple(state): idx for idx, state in enumerate(basis)}
         # convert basis to PyTorch Tensor
-        self.basis = torch.tensor(basis, dtype=torch.long)
+        self.basis = np.array(basis, dtype=np.int32)
 
     # function to implement the diagonal interaction term
     def U_interaction(self, state: tuple):
