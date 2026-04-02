@@ -10,5 +10,6 @@ dependencies = [
     "jupyter>=1.1.1",
     "matplotlib>=3.10.8",
     "numpy>=2.4.3",
+    "optimistix>=0.1.0",
     "quantax[full]>=0.2.1",
 ]
