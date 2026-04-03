@@ -1,9 +1,15 @@
 import itertools
 import numpy as np
-from functools import partial
 import jax
 import jax.numpy as jnp
-from flax import nnx
+from typing import Callable, Optional, Sequence, Tuple, Union
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import jax.random as jr
+import lrux
+import quantax as qtx
 # import torch
 
 
@@ -113,130 +119,238 @@ class HamiltonianOperator:
 
 # now implement the NN ansatz
 
-# generic MLP helper class
-class MLP(nnx.Module):
+# ### Hidden Fermion Pfaffian State (HFPS)
+
+# %%
+class CNN_Block(eqx.Module):
+    """Residual convolution block"""
+
+    conv1: eqx.nn.Conv
+    conv2: eqx.nn.Conv
+    # static because we use it for an if-else condition
+    block_idx: int = eqx.field(static=True)
+
     def __init__(
         self,
-        hidden_layers: int,
-        input_dim: int,
-        dim_feedforward: int,
-        output_dim: int,
-        rngs: nnx.Rngs,
-        activation=nnx.gelu,
+        channels: int,
+        kernel_size: int,
+        block_idx: int,
+        total_blocks: int,
+        dtype=jnp.float32,
     ):
-        # make it
-        net = [
-            nnx.Linear(input_dim, dim_feedforward, rngs=rngs),
-            activation,
+        lattice = qtx.get_lattice()  # should be of shape (1, L, L)
+        # periodic boundary conditions
+        padding_mode = "CIRCULAR"
+
+        def new_layer(is_first_layer: bool, is_last_layer: bool) -> eqx.nn.Conv:
+            if is_first_layer:
+                in_channels = lattice.shape[0]  # should be 1
+                if lattice.particle_type == qtx.PARTICLE_TYPE.spinful_fermion:
+                    in_channels *= 2  # so first layer has in_channels = 2*1 = 2
+            else:
+                in_channels = channels
+            # should generate a new key each time
+            key = qtx.get_subkeys()
+            conv = eqx.nn.Conv(
+                num_spatial_dims=lattice.ndim,  # should be 2
+                in_channels=in_channels,
+                out_channels=channels,  # out_channels is always the same
+                kernel_size=kernel_size,
+                padding="SAME",
+                use_bias=not is_last_layer,  # i.e. bias for every layer except the last one
+                padding_mode=padding_mode,
+                dtype=dtype,
+                key=key,
+            )
+            # Notes: stride = dilation = groups = 1 by default
+            conv = qtx.nn.apply_he_normal(key, conv)
+            return conv
+
+        self.conv1 = new_layer(block_idx == 0, False)
+        self.conv2 = new_layer(False, block_idx == (total_blocks - 1))
+        self.block_idx = block_idx
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        residual = x.copy()
+        x /= jnp.sqrt(self.block_idx + 1)
+
+        if self.block_idx == 0:
+            x /= jnp.sqrt(2)
+        else:
+            x = jax.nn.gelu(x)
+        x = self.conv1(x)
+        x = jax.nn.gelu(x)
+        x = self.conv2(x)
+
+        if x.shape[0] > residual.shape[0]:
+            residual = jnp.repeat(residual, x.shape[0] // residual.shape[0], axis=0)
+        return x + residual
+
+
+class CNN(qtx.nn.Sequential):
+    """Deep convolutional residual network."""
+
+    nblocks: int
+    channels: int
+    kernel_size: int
+    layers: Tuple[Callable, ...]
+    dtype: jnp.dtype
+    out_dtype: jnp.dtype
+    holomorphic: bool
+
+    def __init__(
+        self,
+        nblocks: int,
+        channels: int,
+        kernel_size: int,
+        dtype=jnp.float32,
+        out_dtype=jnp.float32,
+    ):
+        self.nblocks = nblocks
+        self.kernel_size = kernel_size
+        self.dtype = dtype
+        self.out_dtype = out_dtype
+
+        # check complex/real stuff
+        pair_cpl = False
+        if jnp.isdtype(dtype, "complex floating") and jnp.isdtype(
+            out_dtype, "complex floating"
+        ):
+            holomorphic = True
+        else:
+            holomorphic = False
+            if jnp.isdtype(out_dtype, "complex floating"):
+                pair_cpl = True
+                channels *= 2
+        self.channels = channels
+
+        blocks = [
+            CNN_Block(channels, kernel_size, i, nblocks, dtype) for i in range(nblocks)
         ]
-        for _ in range(hidden_layers):
-            net.append(nnx.Linear(dim_feedforward, dim_feedforward, rngs=rngs))
-            net.append(activation)
-        net.append(nnx.Linear(dim_feedforward, output_dim, rngs=rngs))
-        self.MLP = nnx.Sequential(*net)
+
+        def final_layer(x):
+            x /= jnp.sqrt(nblocks + 1)
+            if pair_cpl is True:
+                x = qtx.nn.pair_cpl(x)
+            x = x.astype(out_dtype)
+            return x
+
+        layers = [qtx.nn.ReshapeConv(dtype), *blocks, final_layer]
+
+        super().__init__(layers, holomorphic)
+
+# %%
+class HFPS(eqx.Module):
+    CNN: Callable
+    N_tilde_x2: int
+    M: int
+    N_occ: int
+    F_vv: Union[jax.Array, Tuple[jax.Array, jax.Array]]
+    F_hh: Union[jax.Array, Tuple[jax.Array, jax.Array]]
+    dtype: jnp.dtype = eqx.field(static=True)
+
+    def __init__(
+        self,
+        n_hidden_fermions: int,
+        num_blocks: int,
+        kernel_size: int,
+        jastrow_channels: int,
+        N_occ: int,
+        F_vv: jax.Array = None,
+        dtype=jnp.float32,
+    ):
+        assert (N_occ + n_hidden_fermions) % 2 == 0, (
+            "Pfaffian requires an even-dimensional matrix!"
+        )
+        self.N_tilde_x2 = 2 * n_hidden_fermions
+        channels = self.N_tilde_x2 + jastrow_channels  # factor of 2 for spin
+        self.CNN = CNN(
+            num_blocks, channels, kernel_size, dtype=jnp.float32, out_dtype=dtype
+        )
+        self.M = 2 * qtx.get_lattice().Nsites  # should be 2L^2
+        self.N_occ = N_occ
+        self.dtype = dtype
+        if jnp.isdtype(dtype, "complex floating"):
+            sqrt_2 = jnp.sqrt(2)
+            real_dtype = jnp.array(0, dtype).real.dtype
+            complex_mode = True
+        else:
+            complex_mode = False
+
+        if F_vv is None:
+            vv_key_1 = qtx.get_subkeys()
+            if complex_mode is True:
+                vv_key_2 = qtx.get_subkeys()
+                self.F_vv = (
+                    jr.normal(vv_key_1, (self.M, self.M), real_dtype) / sqrt_2,
+                    jr.normal(vv_key_2, (self.M, self.M), real_dtype) / sqrt_2,
+                )
+            else:
+                self.F_vv = jr.normal(vv_key_1, (self.M, self.M), dtype)
+        else:
+            if complex_mode is True:
+                self.F_vv = (F_vv.real.astype(real_dtype), F_vv.imag.astype(real_dtype))
+            else:
+                self.F_vv = F_vv.real.astype(dtype)
+
+        hh_key_1 = qtx.get_subkeys()
+        if complex_mode is True:
+            hh_key_2 = qtx.get_subkeys()
+            self.F_hh = (
+                jr.normal(hh_key_1, (n_hidden_fermions, n_hidden_fermions), real_dtype)
+                / sqrt_2,
+                jr.normal(hh_key_2, (n_hidden_fermions, n_hidden_fermions), real_dtype)
+                / sqrt_2,
+            )
+        else:
+            self.F_hh = jr.normal(
+                hh_key_1, (n_hidden_fermions, n_hidden_fermions), dtype
+            )
 
     def __call__(self, x: jax.Array):
-        return self.MLP(x)
-
-
-# quick helper function
-def view_as_complex(x: jax.Array):
-    return x[..., 0] + (1j * x[..., 1])
-
-
-class log_psi_2D_spinful(nnx.Module):
-    def __init__(
-        self,
-        L: int,
-        n: int,
-        hidden_layers: int,
-        dim_feedforward: int,
-        rngs: nnx.Rngs,
-        activation=nnx.gelu,
-    ):
-        self.L = L
-        self.n = n
-        # weights, drawn from a Gaussian distribution (for now)
-        self.w_s = nnx.Param(rngs.normal((2 * (L**2),)))
-        # instantiate MLPs
-        self.f = MLP(hidden_layers, 5, dim_feedforward, 2, rngs, activation)
-        self.g_1_prime = MLP(hidden_layers, 1, dim_feedforward, 2, rngs, activation)
-        self.g_2_prime = MLP(hidden_layers, 1, dim_feedforward, 2, rngs, activation)
-
-    # antisymmetric factor $F: \widetilde{\Lambda}^n \rightarrow \mathbb{C}$
-    def F_antisymmetric(self, x: jax.Array):
-        # x should be integers of shape (batch_size, n, 3) with entries from \widetilde{\Lambda}
-        # contains (x, y, \sigma)
-        # convert spatial coords to complex numbers e^{2\pi i x/L}
-        z_x = jnp.stack(
-            [
-                jnp.cos((2 * jnp.pi * x[:, :, 0]) / self.L),
-                jnp.sin((2 * jnp.pi * x[:, :, 0]) / self.L),
-                jnp.cos((2 * jnp.pi * x[:, :, 1]) / self.L),
-                jnp.sin((2 * jnp.pi * x[:, :, 1]) / self.L),
-                (2 * x[:, :, 2]) - 1,  # encode spin as ±1
-            ],
-            axis=-1,
-        )  # should be (batch_size, n, 5) now
-        # pass through f MLP
-        f_x = view_as_complex(self.f(z_x))  # complex (batch_size, n)
-        vandermonde_matrix = jax.vmap(partial(jnp.vander, increasing=True))(
-            f_x
-        )  # should be of shape (batch_size, n, n)
-        # take the determinant
-        sign, logabsdet = jnp.linalg.slogdet(vandermonde_matrix)
+        # x has entries ±1 representing occupied/unoccupied orbitals
+        CNN_output = self.CNN(x)  # should be of shape (2*N^tilde + k, L, L)
+        # occupation number
+        n = jnp.nonzero(x == 1, size=self.N_occ)[0]
+        log_J_n = CNN_output[self.N_tilde_x2 :, :, :].sum()
+        F_vh = CNN_output[: self.N_tilde_x2, :, :].reshape(-1, self.M).T
+        # convert to complex if needed
+        if jnp.isdtype(self.dtype, "complex floating"):
+            F_vv = (self.F_vv[0] + (1j * self.F_vv[1])).astype(self.dtype)
+            F_hh = (self.F_hh[0] + (1j * self.F_hh[1])).astype(self.dtype)
+        else:
+            F_vv = self.F_vv
+            F_hh = self.F_hh
+        # antisymmetrize F_vv and F_hh
+        # NOTE: can optimize order-of-ops further
+        F_vv = 0.5 * (F_vv - F_vv.T)
+        F_vv = F_vv[n, :][:, n]
+        F_hh = 0.5 * (F_hh - F_hh.T)
+        # take the pfaffian
+        pfaffian_matrix = jnp.block([[F_vv, F_vh[n, :]], [-F_vh.T[:, n], F_hh]])
+        sign, logabspf = lrux.slogpf(pfaffian_matrix)
+        # NOTE: may have to change J_n logic if observe numerical instability
+        # return (
+        #     qtx.utils.LogArray(sign, logabspf)
+        #     * jnp.exp(log_J_n)
+        #     * qtx.nn.fermion_inverse_sign(x)
+        # )
         return (
-            sign,  # complex
-            logabsdet,  # real
-        )  # both should be vectors of shape (batch_size)
+            qtx.utils.LogArray(jnp.cos(jnp.angle(sign) + log_J_n.imag), logabspf + log_J_n.real)
+            * qtx.nn.fermion_inverse_sign(x)
+        )   # change to output only real values
 
-    def eta_symmetric(self, x: jax.Array):
-        # x should be integers of shape (batch_size, n, 3) with entries from \widetilde{\Lambda}
-        # contains (x, y, \sigma)
-        # first flatten the last dimension with an injective map
-        x = (
-            ((2 * self.L) * (x[:, :, 0] % self.L))
-            + (2 * (x[:, :, 1] % self.L))
-            + x[:, :, 2]
-        )
-        N_s = (
-            jax.nn.one_hot(x, num_classes=2 * (self.L**2)).sum(axis=1).astype("float32")
-        )  # (batch_size, 2L^2)
-        # take matrix-vector product with w_s
-        eta = jnp.matmul(N_s, self.w_s)
-        return eta  # should be a vector of shape (batch_size)
+# turn it into a MxM matrix
+def get_J_matrix(N_occ: int) -> jax.Array:
+    assert N_occ % 2 == 0, "N_occ must be even to have a non-zero Pfaffian!"
 
-    def __call__(self, occ_num: jax.Array):
-        # occ_num should be of shape (batch_size, 2*L^2) in an occupation-number basis
-        # need to convert to shape (batch_size, n, 3) with entries from \widetilde{\Lambda}
-        _, nonzero_indices = jax.lax.top_k(occ_num, k=self.n, axis=-1)
-        y_indices = nonzero_indices % self.L
-        temp = nonzero_indices // self.L
-        x_indices = temp % self.L
-        spin_indices = temp // self.L
-        x = jnp.stack([x_indices, y_indices, spin_indices], axis=-1)
-        # now contains (x, y, \sigma)
-        # compute the antisymmetric function F
-        sign, logabsdet = self.F_antisymmetric(
-            x
-        )  # complex/real vectors of shape (batch_size)
-        # compute the symmetric function g
-        # first calculate eta
-        eta = jnp.expand_dims(
-            self.eta_symmetric(x), axis=-1
-        )  # shape (batch_size, 1), dtype=float
-        # now combine them together via:
-        # \Psi = F_1 g_1 + F_2 g_2
-        g_1 = view_as_complex(self.g_1_prime(eta))  # shape (batch_size), dtype=complex
-        g_2 = view_as_complex(self.g_2_prime(eta))
-        # natural log for the final result
-        log_psi = logabsdet + jnp.log(
-            (sign.real * g_1) + (sign.imag * g_2)
-        )  # shape (batch_size), dtype=complex
-        return log_psi
+    # example of a 2x2 antisymmetric matrix with pfaffian=1
+    base_block = jnp.array([[0.0, 1.0], [-1.0, 0.0]])
 
-# other utilities
-def count_params(model):
-    params = nnx.state(model, nnx.Param)
-    leaves = jax.tree_util.tree_leaves(params)
-    return sum(x.size for x in leaves)
+    # make an identity matrix
+    identity = jnp.eye(N_occ // 2)
+
+    # Kronecker product to repeat along the diagonal
+    J = jnp.kron(identity, base_block)
+
+    return J
